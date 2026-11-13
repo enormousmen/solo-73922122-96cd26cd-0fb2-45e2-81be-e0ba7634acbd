@@ -1,7 +1,8 @@
 # 植被调查离线修订合并平台
 
-数据员把外业队的离线修订 CSV 并回当前记录库，供物种分布分析入库。
-FastAPI + SQLite 实现，三方向（基线 / 修订 / 当前）逐字段合并，冲突人工裁决，整批事务化应用。
+数据员把外业队的离线修订 CSV 并回当前记录库，并**自动同步到本地 HTTP 物种分布分析库**，免去反复导出 CSV。
+FastAPI + SQLite 实现：三方向（基线 / 修订 / 当前）逐字段合并，冲突人工裁决，整批事务化应用；
+同步采用**事务发件箱（transactional outbox）**模式，两端各自用 SQLite 持久化。
 
 ## 快速启动（Docker Compose）
 
@@ -9,15 +10,45 @@ FastAPI + SQLite 实现，三方向（基线 / 修订 / 当前）逐字段合并
 docker compose up --build
 ```
 
-浏览器打开 **http://localhost:8000** 即可操作。SQLite 数据持久化在名为 `survey-data` 的卷中；
-首次启动自动载入 `data/initial_records.csv` 的 12 条初始记录。
+启动后有两个服务：
 
-本地开发（可选）：
+| 服务 | 地址 | 角色 | SQLite（持久化卷） |
+|---|---|---|---|
+| 业务库（上游） | http://localhost:8000 | 记录维护、合并、同步管理页 | `survey-data` → `/data/survey.db` |
+| 分析库（下游） | http://localhost:8001 | 接收同步的本地 HTTP 分析库 | `analyzer-data` → `/data/analyzer.db` |
+
+浏览器打开 **http://localhost:8000/sync** 即可启用同步、查看进度/错误与两端记录；
+分析库自带页面 http://localhost:8001 可查看下游记录、去重表与故障开关。
+首次启动业务库自动载入 `data/initial_records.csv` 的 12 条初始记录。
+
+本地开发（可选，需开两个进程）：
 
 ```bash
 pip install -r requirements.txt
-uvicorn app.main:app --reload   # http://localhost:8000
+uvicorn app.main:app --port 8000                       # 业务库，SYNC_TARGET 默认 http://127.0.0.1:8001
+ANALYZER_DB_PATH=./analyzer.db uvicorn analyzer.main:app --port 8001   # 分析库
 ```
+
+## 同步如何保证不重不漏
+
+- **首次启用 = 同一时点全量快照**：启用操作在单个数据库事务里，把当时全部记录打包成一条快照发件箱条目（含各记录版本）。
+- **之后按提交顺序增量同步**：每次人工增/改/删、以及整批合并，都在**写业务数据的同一事务**里追加变更日志（全局单调 `seq`）与发件箱条目，因此要么连同业务一起提交、要么都不提交，不会漏记或重复。
+- **整批合并整批可见**：一次合并的多项动作共享一个 `batch_id`，打包为同一条发件箱投递；下游在单事务内应用，整批可见或整批不可见。**拒绝、放弃或失败的合并不产生任何投递**。
+- **下游停收不阻塞业务**：后台守护线程负责 HTTP 投递，网络等待不持有业务写锁；下游返回 503 或网络不通时，条目留在发件箱持续重试，业务照常提交。
+- **重启/恢复自动追平**：进程退出时遗留在途（in_flight）的条目，启动时自动重新排队；下游恢复或任一服务重启后，后台线程按序补发直到全部送达。
+- **丢回执重投不重复生效**：每条投递带固定 `delivery_id`，下游用去重表（`applied_deliveries`）幂等处理；保存成功但回执丢失后重投，命中去重直接返回，不重复改数。
+- **旧投递不覆盖新值、不复活同 ID 重建记录**：下游维护高水位 `last_seq`，仅应用连续且新高水位之后的变更；缺口/乱序投递拒绝（HTTP 409），已应用区间的旧投递整体跳过；同 ID 删除后重建不会被迟到的旧删除误删。
+
+## 同步管理页与故障开关
+
+`http://localhost:8000/sync` 提供：
+
+1. **启用/停用同步**：停用期间业务照常编辑，变更持续留痕，重新启用自动续传（不重不漏）。
+2. **分析库状态与故障开关**（代理下游，也可在 8001 页面直接操作）：
+   - **停收/恢复接收**：停收时下游对所有投递返回 503 且不写入，用于验证"下游不可用不阻塞上游、恢复后自动追平"。
+   - **保存后丢回执**：开启后下游保存成功却返回错误，用于验证"重投幂等、不重复生效"。
+3. **发件箱进度**：每条投递的类型（快照/增量）、seq 区间、条目数、状态、尝试次数、最近错误与送达时间。
+4. **两端记录对照**：上游入口与下游当前记录（含版本 seq）。
 
 ## 数据格式
 
@@ -81,13 +112,32 @@ R001,Q1,羊草,12
 ## 项目结构
 
 ```text
-app/
-  main.py        FastAPI 路由：记录维护、基线、上传、预览、确认
-  merge.py       三方向逐字段合并与冲突裁决合成
-  csvio.py       修订 CSV 解析（校验非负整数株数等）与导出
-  db.py          SQLite 访问层；确认动作单事务应用
-  templates/     页面模板
+app/                  业务库（上游，端口 8000）
+  main.py             FastAPI 路由：记录维护、基线、上传、预览、确认、同步页、下游开关代理
+  sync.py             后台同步投递线程：按发件箱顺序 HTTP 投递，失败重试，不持业务锁
+  merge.py            三方向逐字段合并与冲突裁决合成
+  csvio.py            修订 CSV 解析（校验非负整数株数等）与导出
+  db.py              SQLite 访问层：records/baselines/previews + changes 变更日志 + outbox 发件箱 + sync_meta
+  templates/          页面模板（含 sync.html 同步管理页）
+analyzer/             本地 HTTP 分析库（下游，端口 8001）
+  main.py             接收 /sync/snapshot、/sync/changes；停收与丢回执开关；记录/去重查询
+  db.py               下游 SQLite：records（带版本）、applied_deliveries 去重、state 高水位与开关
+  templates/index.html
 data/initial_records.csv   初始数据（首次启动自动载入）
 samples/                   两队交叉修订样例
-Dockerfile / docker-compose.yml
+Dockerfile / docker-compose.yml   同一镜像起两个服务，compose 一键启动完整环境
 ```
+
+## 同步数据表说明
+
+上游 `survey.db`：
+
+- `changes`：变更日志，`seq` 全局自增，记录每次 upsert/delete（整批合并共享 `batch_id`）。
+- `outbox`：事务发件箱，`status` 在 queued / in_flight / delivered 间流转，含尝试次数与最近错误。
+- `sync_meta`：`enabled`（同步开关）、`capturing`（启用后持续记录，停用也不漏）、`target_url`。
+
+下游 `analyzer.db`：
+
+- `records`：分析记录，带 `version`（来源变更 seq）。
+- `applied_deliveries`：已生效 `delivery_id` 去重表，重投幂等。
+- `state`：`accepting`（停收开关）、`lose_receipt`（丢回执开关）、`last_seq`（高水位）。

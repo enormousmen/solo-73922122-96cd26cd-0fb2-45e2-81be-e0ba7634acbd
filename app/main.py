@@ -4,11 +4,12 @@ import os
 import uuid
 from pathlib import Path
 
+import httpx
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from . import db
+from . import db, sync
 from .csvio import dump_csv, parse_csv
 from .merge import FIELD_LABELS, FIELDS, build_final_actions, compute_plan
 
@@ -23,6 +24,7 @@ templates.env.globals["FIELD_LABELS"] = FIELD_LABELS
 @app.on_event("startup")
 def startup():
     db.init_db(SEED_CSV)
+    sync.start_worker()
 
 
 def redirect(url: str, msg: str = "") -> RedirectResponse:
@@ -236,3 +238,79 @@ async def preview_confirm(token: str, request: Request):
 
     db.set_preview_status(token, "applied", f"已应用 {len(actions)} 项离线改动")
     return redirect("/", f"合并完成：已应用 {len(actions)} 项离线改动")
+
+
+# ---------------- 同步页 / 分析库代理 ----------------
+
+
+def _analyzer_url() -> str:
+    return db.get_sync_meta().get("target_url", db.SYNC_TARGET).rstrip("/")
+
+
+@app.get("/sync", response_class=HTMLResponse)
+def sync_page(request: Request, msg: str = ""):
+    overview = db.sync_overview()
+    analyzer = {"reachable": False, "state": {}, "records": [], "deliveries": [], "error": ""}
+    base = _analyzer_url()
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            state_resp = client.get(base + "/api/state")
+            state_resp.raise_for_status()
+            rec_resp = client.get(base + "/api/records")
+            rec_resp.raise_for_status()
+            dl_resp = client.get(base + "/api/deliveries")
+            dl_resp.raise_for_status()
+        analyzer["reachable"] = True
+        analyzer["state"] = state_resp.json()
+        analyzer["records"] = rec_resp.json()
+        analyzer["deliveries"] = dl_resp.json()
+    except Exception as e:
+        analyzer["error"] = str(e)[:200]
+
+    return templates.TemplateResponse(
+        request,
+        "sync.html",
+        {
+            "request": request,
+            "overview": overview,
+            "outbox": db.list_outbox(),
+            "analyzer": analyzer,
+            "msg": msg,
+        },
+    )
+
+
+@app.post("/sync/enable")
+def sync_enable():
+    started = db.enable_sync()
+    if started:
+        return redirect("/sync", "同步已启用：已在同一事务生成全量快照，后台将自动投递并追平后续变更")
+    return redirect("/sync", "同步本就处于启用状态")
+
+
+@app.post("/sync/disable")
+def sync_disable():
+    db.disable_sync()
+    return redirect("/sync", "同步已停用；变更仍在本地记录，重新启用后自动续传，不重不漏")
+
+
+@app.post("/sync/analyzer/accepting")
+def proxy_accepting(value: str = Form("1")):
+    try:
+        with httpx.Client(timeout=5.0, follow_redirects=True) as client:
+            resp = client.post(_analyzer_url() + "/admin/accepting", data={"value": value})
+            resp.raise_for_status()
+    except Exception as e:
+        return redirect("/sync", f"切换分析库接收状态失败：{e}")
+    return redirect("/sync", "分析库接收状态已切换")
+
+
+@app.post("/sync/analyzer/lose_receipt")
+def proxy_lose_receipt(value: str = Form("0")):
+    try:
+        with httpx.Client(timeout=5.0, follow_redirects=True) as client:
+            resp = client.post(_analyzer_url() + "/admin/lose_receipt", data={"value": value})
+            resp.raise_for_status()
+    except Exception as e:
+        return redirect("/sync", f"切换丢回执开关失败：{e}")
+    return redirect("/sync", "分析库丢回执开关已切换")

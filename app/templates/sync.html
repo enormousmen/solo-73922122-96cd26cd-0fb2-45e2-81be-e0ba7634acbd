@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+{% block title %}同步管理 · 植被调查{% endblock %}
+{% block content %}
+{% if msg %}<div class="msg">{{ msg }}</div>{% endif %}
+
+<section>
+  <h2>① 同步状态与开关</h2>
+  <p>
+    同步状态：
+    {% if overview.meta.enabled == '1' %}<span class="tag add">已启用</span>
+    {% else %}<span class="tag">未启用</span>{% endif %}
+    　变更记录：
+    {% if overview.meta.capturing == '1' %}<span class="tag add">持续记录中</span>
+    {% else %}<span class="tag">尚未开始</span>{% endif %}
+    　分析库地址：{{ overview.meta.target_url }}
+  </p>
+  <p class="muted">
+    首次启用会在同一事务复制同一时点的全量记录（快照）；之后按提交顺序同步人工维护与整批合并的增改删。
+    停用期间业务照常编辑且变更持续留痕，重新启用自动续传，不重不漏。
+  </p>
+  <form method="post" action="/sync/enable" style="display:inline">
+    <button type="submit">启用同步（首次含全量快照）</button>
+  </form>
+  <form method="post" action="/sync/disable" style="display:inline">
+    <button class="plain" type="submit">停用同步</button>
+  </form>
+  <p class="muted" style="margin-top:10px">
+    发件箱：待投递 {{ overview.counts.queued }} ｜ 在途 {{ overview.counts.in_flight }}
+    ｜ 已送达 {{ overview.counts.delivered }} ｜ 等待重试 {{ overview.counts.queued }}
+    {% if overview.oldest_pending_at %}　最早待投条目：{{ overview.oldest_pending_at }}{% endif %}
+    {% if overview.last_delivered_at %}　最近送达：{{ overview.last_delivered_at }}{% endif %}
+  </p>
+</section>
+
+<section>
+  <h2>② 分析库（下游）状态与故障开关</h2>
+  {% if not analyzer.reachable %}
+    <p><span class="tag del">分析库不可达</span>
+       <span class="muted">{{ analyzer.error }}　—— 业务提交不受影响，发件箱将持续重试，恢复后自动追平。</span></p>
+  {% else %}
+    <p>
+      连接：<span class="tag add">可达</span>
+      　接收状态：
+      {% if analyzer.state.accepting == '1' %}<span class="tag add">接收中</span>
+      {% else %}<span class="tag del">已停收</span>{% endif %}
+      　高水位 seq：{{ analyzer.state.last_seq }}
+    </p>
+    <form method="post" action="/sync/analyzer/accepting" style="display:inline">
+      {% if analyzer.state.accepting == '1' %}
+        <input type="hidden" name="value" value="0">
+        <button class="danger" type="submit">让分析库停收（模拟下游不可用）</button>
+      {% else %}
+        <input type="hidden" name="value" value="1">
+        <button type="submit">恢复分析库接收</button>
+      {% endif %}
+    </form>
+    <form method="post" action="/sync/analyzer/lose_receipt" style="display:inline">
+      {% if analyzer.state.lose_receipt == '1' %}
+        <input type="hidden" name="value" value="0">
+        <button class="plain" type="submit">关闭"保存后丢回执"模拟</button>
+      {% else %}
+        <input type="hidden" name="value" value="1">
+        <button class="plain" type="submit">模拟"保存后丢回执"（下次投递生效）</button>
+      {% endif %}
+    </form>
+    <p class="muted">分析库自带页面也可直接操作：<a href="{{ overview.meta.target_url }}/" target="_blank">{{ overview.meta.target_url }}/</a></p>
+  {% endif %}
+</section>
+
+<section>
+  <h2>③ 发件箱（本地提交顺序，最新在前）</h2>
+  <table>
+    <tr><th>#</th><th>类型</th><th>批次</th><th>seq 区间</th><th>条目数</th><th>创建时间</th><th>状态</th><th>尝试</th><th>最近错误 / 送达时间</th></tr>
+    {% for o in outbox %}
+    <tr>
+      <td>{{ o.id }}</td>
+      <td>{% if o.kind == 'snapshot' %}<span class="tag conf">全量快照</span>{% else %}<span class="tag upd">增量</span>{% endif %}</td>
+      <td style="font-family:monospace;font-size:12px">{{ o.batch_id[:8] if o.batch_id else '—' }}</td>
+      <td>{% if o.seq_start is none %}—{% else %}{{ o.seq_start }}…{{ o.seq_end }}{% endif %}</td>
+      <td>{{ o.size }}</td>
+      <td>{{ o.created_at }}</td>
+      <td>
+        {% if o.status == 'delivered' %}<span class="tag add">已送达</span>
+        {% elif o.status == 'in_flight' %}<span class="tag conf">在途</span>
+        {% else %}<span class="tag del">待投递/重试</span>{% endif %}
+      </td>
+      <td>{{ o.attempts }}</td>
+      <td class="muted">{% if o.status == 'delivered' %}{{ o.delivered_at }}{% else %}{{ o.last_error }}{% endif %}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="9" class="muted">发件箱为空（启用同步后才会产生条目）。</td></tr>
+    {% endfor %}
+  </table>
+</section>
+
+<section>
+  <h2>④ 两端记录对照</h2>
+  <h3 style="font-size:14px">本业务库（上游）</h3>
+  <p class="muted">完整记录见<a href="/">首页当前记录</a>。</p>
+  <h3 style="font-size:14px">分析库（下游，{{ analyzer.records|length }} 条）</h3>
+  {% if analyzer.reachable %}
+  <table>
+    <tr><th>ID</th><th>样方</th><th>物种</th><th>株数</th><th>版本 seq</th></tr>
+    {% for r in analyzer.records %}
+    <tr><td>{{ r.id }}</td><td>{{ r.quadrat }}</td><td>{{ r.species }}</td><td>{{ r.count }}</td><td>{{ r.version }}</td></tr>
+    {% else %}
+    <tr><td colspan="5" class="muted">分析库暂无记录（快照尚未送达）。</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">分析库不可达，暂无法展示下游记录。</p>
+  {% endif %}
+</section>
+
+<p><a class="btn plain" href="/">返回首页</a></p>
+{% endblock %}

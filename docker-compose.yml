@@ -4,10 +4,25 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - DB_PATH=/data/app.db
+      - DB_PATH=/data/survey.db
+      - SYNC_TARGET=http://analyzer:8001
     volumes:
       - survey-data:/data
+    depends_on:
+      - analyzer
+    restart: unless-stopped
+
+  analyzer:
+    build: .
+    command: ["uvicorn", "analyzer.main:app", "--host", "0.0.0.0", "--port", "8001"]
+    ports:
+      - "8001:8001"
+    environment:
+      - ANALYZER_DB_PATH=/data/analyzer.db
+    volumes:
+      - analyzer-data:/data
     restart: unless-stopped
 
 volumes:
   survey-data:
+  analyzer-data:

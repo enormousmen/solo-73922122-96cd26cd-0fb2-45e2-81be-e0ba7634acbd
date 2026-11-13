@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>{% block title %}物种分布分析库（下游）{% endblock %}</title>
+<style>
+  body { font-family: "PingFang SC", "Microsoft YaHei", sans-serif; margin: 0; background: #f3f5f8; color: #222b36; }
+  header { background: #274472; color: #fff; padding: 12px 24px; }
+  header h1 { display: inline; font-size: 18px; margin: 0; }
+  main { max-width: 1100px; margin: 20px auto; padding: 0 16px; }
+  section { background: #fff; border: 1px solid #dde3ea; border-radius: 8px; padding: 16px 20px; margin-bottom: 20px; }
+  h2 { font-size: 16px; margin-top: 0; border-left: 4px solid #274472; padding-left: 8px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #dde3ea; padding: 6px 8px; font-size: 14px; text-align: left; }
+  th { background: #eef2f8; }
+  button, .btn { background: #274472; color: #fff; border: none; border-radius: 4px; padding: 6px 14px; cursor: pointer; font-size: 14px; text-decoration: none; display: inline-block; }
+  button.warn { background: #a05a2c; }
+  button.off { background: #6b7480; }
+  .msg { background: #e8f1fb; border: 1px solid #a9c6e8; border-radius: 6px; padding: 10px 14px; margin-bottom: 16px; }
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
+  .tag.ok { background: #e1f3e1; color: #226622; }
+  .tag.stop { background: #fbe2e2; color: #8c2b2b; }
+  .tag.snap { background: #e7e1fb; color: #442b8c; }
+  .tag.chg { background: #e2ecfb; color: #2b4d8c; }
+  .muted { color: #777; font-size: 13px; }
+  form.inline { display: inline; }
+</style>
+</head>
+<body>
+<header><h1>🔬 物种分布分析库（下游同步接收端）</h1></header>
+<main>
+{% if msg %}<div class="msg">{{ msg }}</div>{% endif %}
+
+<section>
+  <h2>接收开关与故障注入</h2>
+  <p>接收状态：
+    {% if state.accepting == '1' %}<span class="tag ok">接收中</span>
+    {% else %}<span class="tag stop">已停收（投递将返回 503，不写入）</span>{% endif %}
+    　已应用高水位 seq：<b>{{ state.last_seq }}</b>
+    　保存后丢回执：
+    {% if state.lose_receipt == '1' %}<span class="tag stop">开启（保存成功但返回错误，验证重投幂等）</span>
+    {% else %}<span class="tag ok">关闭</span>{% endif %}
+  </p>
+  <form class="inline" method="post" action="/admin/accepting">
+    {% if state.accepting == '1' %}
+      <input type="hidden" name="value" value="0"><button class="warn" type="submit">停收（模拟下游不可用）</button>
+    {% else %}
+      <input type="hidden" name="value" value="1"><button type="submit">恢复接收</button>
+    {% endif %}
+  </form>
+  <form class="inline" method="post" action="/admin/lose_receipt">
+    {% if state.lose_receipt == '1' %}
+      <input type="hidden" name="value" value="0"><button class="off" type="submit">关闭丢回执模拟</button>
+    {% else %}
+      <input type="hidden" name="value" value="1"><button class="warn" type="submit">开启：保存后丢回执</button>
+    {% endif %}
+  </form>
+</section>
+
+<section>
+  <h2>分析库记录（共 {{ records|length }} 条，最大版本 {{ max_version }}）</h2>
+  <table>
+    <tr><th>ID</th><th>样方</th><th>物种</th><th>株数</th><th>版本 seq</th></tr>
+    {% for r in records %}
+    <tr><td>{{ r.id }}</td><td>{{ r.quadrat }}</td><td>{{ r.species }}</td><td>{{ r.count }}</td><td>{{ r.version }}</td></tr>
+    {% endfor %}
+  </table>
+</section>
+
+<section>
+  <h2>已生效投递（去重表，{{ deliveries|length }} 条）</h2>
+  <table>
+    <tr><th>delivery_id</th><th>类型</th><th>生效时间</th></tr>
+    {% for d in deliveries %}
+    <tr>
+      <td>{{ d.delivery_id }}</td>
+      <td>{% if d.kind == 'snapshot' %}<span class="tag snap">全量快照</span>{% else %}<span class="tag chg">增量变更</span>{% endif %}</td>
+      <td>{{ d.applied_at }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</section>
+</main>
+</body>
+</html>
